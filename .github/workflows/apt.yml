@@ -1,0 +1,75 @@
+name: Deploy APT repo
+
+# Publishes the release's .deb packages as a (flat) APT repository under
+# /apt on the gh-pages branch, alongside the coverage report at /coverage.
+# keep_files preserves the coverage content (and vice versa).
+#
+# Requires APT_GPG_PRIVATE_KEY to be set :
+#
+# ```sh
+# export GNUPGHOME=$(mktemp -d)
+# cat > "$GNUPGHOME/skim-key" <<'EOF'
+# %no-protection
+# Key-Type: eddsa
+# Key-Curve: ed25519
+# Subkey-Type: ecdh
+# Subkey-Curve: cv25519
+# Name-Real: skim apt repo
+# Name-Email: apt@skim-rs.github.io
+# Expire-Date: 0
+# %commit
+# EOF
+# gpg --batch --gen-key "$GNUPGHOME/skim-key" 2>&1 | tail -3
+# KEYID=$(gpg --list-secret-keys --with-colons apt@skim-rs.github.io | awk -F: '/^sec:/{print $5; exit}')
+# # Copy the output of the line below
+# gpg --export-secret-keys --armor "$KEYID"
+# ```
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  apt:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release .deb packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ fromJson(inputs.plan).announcement_tag }}
+        run: |
+          mkdir -p apt
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.deb' --dir apt
+          ls -l apt
+      - name: Build APT index
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev apt-utils
+          cd apt
+          dpkg-scanpackages --multiversion . > Packages
+          gzip -k -f Packages
+          apt-ftparchive release . > Release
+      - name: Sign the repo
+        # Skipped when the secret is absent; the repo then stays unsigned
+        # ([trusted=yes]). Add APT_GPG_PRIVATE_KEY (an ASCII-armored private
+        # key) to enable signed-by verification.
+        env:
+          GPG_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          echo "$GPG_KEY" | gpg --batch --import
+          KEYID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')
+          cd apt
+          gpg --batch --yes --default-key "$KEYID" --clearsign -o InRelease Release
+          gpg --batch --yes --default-key "$KEYID" -abs -o Release.gpg Release
+          gpg --export --armor "$KEYID" > skim-archive-keyring.asc
+      - name: Deploy to gh-pages under /apt
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: apt
+          destination_dir: apt
+          keep_files: true

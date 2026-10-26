@@ -1,0 +1,339 @@
+//! Reader is used for reading items from datasource (e.g. stdin or command output)
+//!
+//! After reading in a line, reader will save an item into the pool(items)
+use crate::item::ItemPool;
+use crate::options::SkimOptions;
+use crate::prelude::{Sender, SkimItemReader};
+use crate::spinlock::SpinLock;
+use crate::thread_pool::ThreadPool;
+use crate::{SkimItem, SkimItemReceiver};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+/// Trait for collecting items from command output
+pub trait CommandCollector {
+    /// execute the `cmd` and produce a
+    /// - skim item producer
+    /// - a channel sender, any message send would mean to terminate the `cmd` process (for now).
+    ///
+    /// Internally, the command collector may start several threads(components), the collector
+    /// should add `1` on every thread creation and sub `1` on thread termination. reader would use
+    /// this information to determine whether the collector had stopped or not.
+    fn invoke(
+        &mut self,
+        cmd: &str,
+        components_to_stop: Arc<AtomicUsize>,
+    ) -> (SkimItemReceiver, crate::prelude::Sender<i32>);
+
+    /// Provides a shared thread pool so that chunk-processing work submitted
+    /// by this collector competes for the same threads as the matcher rather
+    /// than spawning additional OS threads.  The default implementation is a
+    /// no-op; collectors that support pool-based I/O should override it.
+    fn set_thread_pool(&mut self, _pool: Arc<ThreadPool>) {}
+}
+
+/// Handle for controlling a running reader
+pub struct ReaderControl {
+    tx_interrupt: Sender<i32>,
+    tx_interrupt_cmd: Option<Sender<i32>>,
+    components_to_stop: Arc<AtomicUsize>,
+    collector_handle: Option<JoinHandle<()>>,
+    items: Arc<SpinLock<Vec<Arc<dyn SkimItem>>>>,
+}
+
+impl ReaderControl {
+    /// Kills the reader and waits for all components to stop
+    pub fn kill(&mut self) {
+        debug!(
+            "kill reader, components before: {}",
+            self.components_to_stop.load(Ordering::SeqCst)
+        );
+
+        let _ = self.tx_interrupt_cmd.clone().map(|tx| tx.send(1));
+        let _ = self.tx_interrupt.send(1);
+        if let Some(handle) = self.collector_handle.take() {
+            let _ = handle.join();
+        }
+        // Command collectors can own additional components outside the reader's
+        // join handle. Wait without consuming a CPU while they process the signal.
+        while self.components_to_stop.load(Ordering::Acquire) != 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Takes all items collected so far
+    #[must_use]
+    pub fn take(&self) -> Vec<Arc<dyn SkimItem>> {
+        let mut items = self.items.lock();
+        let mut ret = Vec::with_capacity(items.len());
+        ret.append(&mut items);
+        ret
+    }
+
+    /// Returns true if the reader has finished and no items remain
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        let items = self.items.lock();
+        self.components_to_stop.load(Ordering::SeqCst) == 0 && items.is_empty()
+    }
+}
+
+impl Drop for ReaderControl {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Reader for streaming items from commands or other sources
+pub struct Reader {
+    cmd_collector: Rc<RefCell<dyn CommandCollector>>,
+    rx_item: Option<SkimItemReceiver>,
+}
+
+impl Reader {
+    /// Creates a new reader from skim options
+    #[must_use]
+    pub fn from_options(options: &SkimOptions) -> Self {
+        Self {
+            cmd_collector: options.cmd_collector.clone(),
+            rx_item: None,
+        }
+    }
+
+    /// Sets the item source (if None, will use command collector)
+    #[must_use]
+    pub fn source(mut self, rx_item: Option<SkimItemReceiver>) -> Self {
+        self.rx_item = rx_item;
+        self
+    }
+
+    /// Forwards a shared thread pool to the underlying [`CommandCollector`] so
+    /// that I/O work shares the matcher's thread budget instead of spawning
+    /// separate OS threads.
+    pub fn set_thread_pool(&mut self, pool: Arc<ThreadPool>) {
+        self.cmd_collector.borrow_mut().set_thread_pool(pool);
+    }
+
+    /// Starts the reader and returns a control handle
+    pub fn run(&mut self, app_tx: Sender<Vec<Arc<dyn SkimItem>>>, cmd: &str) -> ReaderControl {
+        let components_to_stop: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let items = Arc::new(SpinLock::new(Vec::new()));
+
+        let (rx_item, tx_interrupt_cmd) = self.rx_item.take().map_or_else(
+            || {
+                let components_to_stop_clone = components_to_stop.clone();
+                let (rx_item, tx_interrupt_cmd) = self.cmd_collector.borrow_mut().invoke(cmd, components_to_stop_clone);
+                (rx_item, Some(tx_interrupt_cmd))
+            },
+            |rx| (rx, None),
+        );
+
+        let components_to_stop_clone = components_to_stop.clone();
+        let (tx_interrupt, collector_handle) =
+            collect_items(components_to_stop_clone, rx_item, move |items| _ = app_tx.send(items));
+
+        ReaderControl {
+            tx_interrupt,
+            tx_interrupt_cmd,
+            components_to_stop,
+            collector_handle: Some(collector_handle),
+            items,
+        }
+    }
+
+    /// Starts collecting items and sending them to the pool directly
+    /// Returns a control handle
+    pub fn collect(&mut self, item_pool: Arc<ItemPool>, cmd: &str) -> ReaderControl {
+        let components_to_stop: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let items = Arc::new(SpinLock::new(Vec::new()));
+
+        let (rx_item, tx_interrupt_cmd) = self.rx_item.take().map_or_else(
+            || {
+                let components_to_stop_clone = components_to_stop.clone();
+                let (rx_item, tx_interrupt_cmd) = self.cmd_collector.borrow_mut().invoke(cmd, components_to_stop_clone);
+                (rx_item, Some(tx_interrupt_cmd))
+            },
+            |rx| (rx, None),
+        );
+
+        let components_to_stop_clone = components_to_stop.clone();
+        let (tx_interrupt, collector_handle) = collect_items(components_to_stop_clone, rx_item, move |items| {
+            item_pool.append(items);
+        });
+        debug!("collect: started ({components_to_stop:?} components)");
+
+        ReaderControl {
+            tx_interrupt,
+            tx_interrupt_cmd,
+            components_to_stop,
+            collector_handle: Some(collector_handle),
+            items,
+        }
+    }
+}
+
+impl Default for Reader {
+    fn default() -> Self {
+        Self {
+            cmd_collector: Rc::new(RefCell::new(SkimItemReader::default())) as Rc<RefCell<dyn CommandCollector>>,
+            rx_item: Default::default(),
+        }
+    }
+}
+
+fn collect_items<F>(
+    components_to_stop: Arc<AtomicUsize>,
+    rx_item: SkimItemReceiver,
+    callback: F,
+) -> (Sender<i32>, JoinHandle<()>)
+where
+    F: Fn(Vec<Arc<dyn SkimItem>>) + Send + 'static,
+{
+    let (tx_interrupt, rx_interrupt) = crate::prelude::bounded(8);
+
+    components_to_stop.fetch_add(1, Ordering::AcqRel);
+    let handle = std::thread::spawn(move || {
+        debug!("collect_item start");
+
+        loop {
+            if let Ok(Some(msg)) = rx_interrupt.try_recv() {
+                debug!("interrupt: {msg}");
+                break;
+            }
+            match rx_item.recv_timeout(std::time::Duration::from_millis(1)) {
+                Ok(items) => {
+                    trace!("collect_item: got {} items", items.len());
+                    callback(items);
+                }
+                Err(kanal::ReceiveErrorTimeout::Timeout) => {
+                    // No items within the timeout — loop back to check the
+                    // interrupt channel before blocking again.
+                }
+                Err(kanal::ReceiveErrorTimeout::Closed | kanal::ReceiveErrorTimeout::SendClosed) => {
+                    break;
+                }
+            }
+        }
+
+        components_to_stop.fetch_sub(1, Ordering::AcqRel);
+        debug!("collect_item stop");
+    });
+
+    (tx_interrupt, handle)
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::time::{Duration, Instant};
+
+    fn source(text: &str) -> SkimItemReceiver {
+        SkimItemReader::default().of_bufread(Cursor::new(text.to_owned().into_bytes()))
+    }
+
+    /// Spin until `cond` holds or a short timeout elapses.
+    fn wait_until(mut cond: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !cond() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn collect_streams_items_into_pool() {
+        let pool = Arc::new(ItemPool::new());
+        let mut reader = Reader::default().source(Some(source("a\nb\nc\n")));
+        let control = reader.collect(pool.clone(), "");
+        wait_until(|| pool.len() == 3);
+        assert_eq!(pool.len(), 3);
+        drop(control);
+    }
+
+    #[test]
+    fn run_sends_items_to_channel() {
+        let (tx, rx) = kanal::unbounded::<Vec<Arc<dyn SkimItem>>>();
+        let mut reader = Reader::default().source(Some(source("x\ny\n")));
+        let control = reader.run(tx, "");
+        wait_until(|| control.is_done());
+
+        let mut count = 0;
+        while let Ok(Some(batch)) = rx.try_recv() {
+            count += batch.len();
+        }
+        assert_eq!(count, 2);
+        drop(control);
+    }
+
+    #[test]
+    fn is_done_true_after_completion() {
+        let pool = Arc::new(ItemPool::new());
+        let mut reader = Reader::default().source(Some(source("only\n")));
+        let control = reader.collect(pool.clone(), "");
+        wait_until(|| control.is_done());
+        assert!(control.is_done());
+    }
+
+    #[test]
+    fn kill_stops_all_components() {
+        let pool = Arc::new(ItemPool::new());
+        let mut reader = Reader::default().source(Some(source("a\nb\n")));
+        let mut control = reader.collect(pool, "");
+        control.kill();
+        // After kill, no components remain running.
+        assert!(control.is_done());
+    }
+
+    #[test]
+    fn run_without_source_invokes_command() {
+        // With no preset source, `run` falls back to invoking the command via
+        // the command collector.
+        #[cfg(unix)]
+        let cmd = "printf 'a\\nb\\n'";
+        #[cfg(windows)]
+        let cmd = "echo a & echo b";
+
+        let (tx, rx) = kanal::unbounded::<Vec<Arc<dyn SkimItem>>>();
+        let mut reader = Reader::default();
+        let control = reader.run(tx, cmd);
+        wait_until(|| control.is_done());
+
+        let mut count = 0;
+        while let Ok(Some(batch)) = rx.try_recv() {
+            count += batch.len();
+        }
+        assert_eq!(count, 2);
+        drop(control);
+    }
+
+    #[test]
+    fn collect_without_source_invokes_command() {
+        // Same command-invoking fallback for the pool-collecting path.
+        #[cfg(unix)]
+        let cmd = "printf 'x\\ny\\nz\\n'";
+        #[cfg(windows)]
+        let cmd = "echo x & echo y & echo z";
+
+        let pool = Arc::new(ItemPool::new());
+        let mut reader = Reader::default();
+        let control = reader.collect(pool.clone(), cmd);
+        wait_until(|| pool.len() == 3);
+        assert_eq!(pool.len(), 3);
+        drop(control);
+    }
+
+    #[test]
+    fn take_returns_empty_for_pool_collection() {
+        // `collect` routes items to the pool, not the control's own buffer.
+        let pool = Arc::new(ItemPool::new());
+        let mut reader = Reader::default().source(Some(source("a\n")));
+        let control = reader.collect(pool, "");
+        wait_until(|| control.is_done());
+        assert!(control.take().is_empty());
+    }
+}

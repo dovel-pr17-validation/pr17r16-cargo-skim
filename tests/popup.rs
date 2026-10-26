@@ -1,0 +1,218 @@
+#![allow(missing_docs, clippy::pedantic)]
+// The Zellij harness is cross-platform, but this file stays unix-only for
+// reasons unrelated to the multiplexer: it installs a mock `tmux`/`sh` binary
+// (made executable via `std::os::unix::fs::PermissionsExt`) to assert how skim
+// shells out for its `--tmux` popup feature.
+// (`#![cfg(unix)]` already covers both Linux and macOS.)
+#![cfg(unix)]
+#[allow(dead_code)]
+mod common;
+
+use common::zellij::Keys::*;
+use common::zellij::ZellijController;
+use std::fs::{File, Permissions};
+use std::io::{Read, Result, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
+fn setup_tmux_mock(tmux: &ZellijController) -> Result<String> {
+    let dir = &tmux.tempdir;
+    let path = dir.path().join("tmux");
+    let mock_bin = Path::new(&path);
+    let mut writer = File::create(mock_bin)?;
+    let outfile = dir.path().join("tmux-mock-cmd");
+    writer.write_fmt(format_args!(
+        "#!/bin/sh
+
+printf '%s\\0' \"$@\" > {}
+",
+        outfile.to_str().unwrap()
+    ))?;
+    std::fs::set_permissions(mock_bin, Permissions::from_mode(0o777))?;
+    // These tests exercise skim's *tmux* popup backend, but the harness runs
+    // skim inside a Zellij pane (so `$ZELLIJ` is set and Zellij would otherwise
+    // take priority). Unset `$ZELLIJ` and advertise a `$TMUX` so skim selects
+    // the tmux backend and shells out to the mock `tmux` installed on `$PATH`.
+    tmux.send_keys(&[
+        Str(&format!(
+            "export PATH={}:$PATH; unset ZELLIJ; export TMUX=tmux-mock,0,0",
+            dir.path().to_str().unwrap()
+        )),
+        Enter,
+    ])?;
+
+    tmux.until(|_| Path::new(&tmux.tempdir.path().join("tmux")).exists())?;
+
+    Ok(outfile.to_str().unwrap().to_string())
+}
+
+fn get_tmux_cmd(outfile: &str) -> Result<String> {
+    let mut cmd = String::new();
+    File::open(outfile)?.read_to_string(&mut cmd)?;
+    Ok(cmd)
+}
+
+/// Regression test: when --popup/--tmux is set via SKIM_DEFAULT_OPTIONS the child
+/// sk process must not re-enter the popup path (infinite recursion guard).
+#[test]
+fn tmux_via_skim_default_options() -> Result<()> {
+    let tmux = ZellijController::new()?;
+    let outfile = setup_tmux_mock(&tmux)?;
+    // Run sk with SKIM_DEFAULT_OPTIONS=--tmux set inline so the popup path is exercised.
+    let cmd = format!("SKIM_DEFAULT_OPTIONS='--tmux' {}", crate::common::SK);
+    tmux.send_keys(&[Str(&cmd), Enter])?;
+    tmux.until(|_| Path::new(&outfile).exists())?;
+    let cmd = get_tmux_cmd(&outfile)?;
+    // The parent should have opened exactly one popup; the child must not loop back.
+    assert!(cmd.starts_with("display-popup"));
+    // _SKIM_POPUP must be forwarded so the child knows it is already inside a popup
+    assert!(cmd.contains("_SKIM_POPUP=1"));
+
+    Ok(())
+}
+
+#[test]
+fn tmux_vanilla() -> Result<()> {
+    let mut tmux = ZellijController::new()?;
+    let outfile = setup_tmux_mock(&tmux)?;
+    tmux.start_sk(None, &["--tmux"])?;
+    tmux.until(|_| Path::new(&outfile).exists())?;
+    let cmd = get_tmux_cmd(&outfile)?;
+    assert!(cmd.starts_with("display-popup"));
+    assert!(cmd.contains("-E"));
+    assert!(cmd.contains("--print-query"));
+    assert!(cmd.contains("--print-header"));
+    assert!(cmd.contains("--print-current"));
+    assert!(cmd.contains("--print-score"));
+    assert!(!cmd.contains("<"));
+
+    Ok(())
+}
+
+#[test]
+fn tmux_popup_name_becomes_popup_title() -> Result<()> {
+    let mut tmux = ZellijController::new()?;
+    let outfile = setup_tmux_mock(&tmux)?;
+    tmux.start_sk(None, &["--tmux", "--popup-name='Command history'"])?;
+    tmux.until(|_| Path::new(&outfile).exists())?;
+    let cmd = get_tmux_cmd(&outfile)?;
+    let args: Vec<_> = cmd.split('\0').collect();
+    assert!(
+        args.windows(2).any(|pair| pair == ["-T", "Command history"]),
+        "missing popup title: {cmd:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn tmux_border_label_is_a_popup_name_alias() -> Result<()> {
+    let mut tmux = ZellijController::new()?;
+    let outfile = setup_tmux_mock(&tmux)?;
+    tmux.start_sk(None, &["--tmux", "--border-label='Command history'"])?;
+    tmux.until(|_| Path::new(&outfile).exists())?;
+    let cmd = get_tmux_cmd(&outfile)?;
+    let args: Vec<_> = cmd.split('\0').collect();
+    assert!(
+        args.windows(2).any(|pair| pair == ["-T", "Command history"]),
+        "missing popup title: {cmd:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn tmux_output_format() -> Result<()> {
+    let mut tmux = ZellijController::new()?;
+    let outfile = setup_tmux_mock(&tmux)?;
+    tmux.start_sk(
+        None,
+        &[
+            "--tmux",
+            "--output-format",
+            "output-format",
+            "--output-format=output-format",
+        ],
+    )?;
+    tmux.until(|_| Path::new(&outfile).exists())?;
+    let cmd = get_tmux_cmd(&outfile)?;
+    assert!(cmd.starts_with("display-popup"));
+    assert!(cmd.contains("-E"));
+    assert!(cmd.contains("--print-query"));
+    assert!(cmd.contains("--print-header"));
+    assert!(cmd.contains("--print-current"));
+    assert!(cmd.contains("--print-score"));
+    assert!(cmd.contains("--print-score"));
+    assert!(!cmd.contains("output-format"));
+    assert!(!cmd.contains("<"));
+
+    Ok(())
+}
+
+#[test]
+fn tmux_stdin() -> Result<()> {
+    let mut tmux = ZellijController::new()?;
+    let outfile = setup_tmux_mock(&tmux)?;
+    tmux.start_sk(Some("ls"), &["--tmux"])?;
+    tmux.until(|_| Path::new(&outfile).exists())?;
+    let cmd = get_tmux_cmd(&outfile)?;
+    println!("{}", cmd);
+    assert!(cmd.contains("<"));
+
+    Ok(())
+}
+
+#[test]
+fn tmux_quote() -> Result<()> {
+    let mut tmux = ZellijController::new()?;
+    let outfile = setup_tmux_mock(&tmux)?;
+    tmux.send_keys(&[Str("export SHELL=/bin/sh"), Enter])?;
+    tmux.send_keys(&[Str("export SKIM_ESCAPED_VAR=';;'"), Enter])?;
+    tmux.start_sk(None, &["--tmux", "--bind 'ctrl-a:reload(ls /foo*)'"])?;
+    tmux.until(|_| Path::new(&outfile).exists())?;
+    let cmd = get_tmux_cmd(&outfile)?;
+    println!("tmux cmd: {cmd}");
+    assert!(cmd.starts_with("display-popup"));
+    assert!(cmd.contains("-E"));
+    assert!(cmd.contains("--bind ctrl-a:reload'(ls /foo*)'"));
+    assert!(cmd.contains("SKIM_ESCAPED_VAR=;\\;"));
+
+    Ok(())
+}
+
+/// The shell key bindings name their popup by purpose (`skim: files`,
+/// `skim: command history`, `skim: directories`). The name contains a space, so
+/// this guards the whole path: the widget's command line must reach skim as one
+/// argument, and skim must forward the name to the multiplexer.
+#[test]
+fn key_binding_popup_name_reaches_the_multiplexer() -> Result<()> {
+    let tmux = ZellijController::new()?;
+    let outfile = setup_tmux_mock(&tmux)?;
+    // Same shape as the shipped `__skimcmd` in shell/key-bindings.{bash,zsh},
+    // pointing at the test binary instead of whatever `sk` is on `$PATH`. The
+    // name is a quoted literal at the call site, exactly like the widgets do it.
+    let widget = format!(
+        "__skimcmd() {{
+        [ -n \"$TMUX_PANE\" ] && {{ [ \"${{SKIM_TMUX:-0}}\" != 0 ] || [ -n \"$SKIM_TMUX_OPTS\" ]; }} &&
+            echo \"{} --tmux=${{SKIM_TMUX_OPTS:-center,${{SKIM_TMUX_HEIGHT:-40%}}}}\" || echo sk
+    }}",
+        crate::common::SK
+    );
+    // `$TMUX_PANE`/`$SKIM_TMUX` are what make the widget switch to a popup; the
+    // harness runs skim inside Zellij, so provide them explicitly.
+    tmux.send_keys(&[
+        Str(&format!(
+            "unset SKIM_TMUX_OPTS; export TMUX_PANE=1 SKIM_TMUX=1; {widget}; $(__skimcmd) --popup-name='skim: command history' --query=hist"
+        )),
+        Enter,
+    ])?;
+    tmux.until(|_| Path::new(&outfile).exists())?;
+    let cmd = get_tmux_cmd(&outfile)?;
+    let args: Vec<_> = cmd.split('\0').collect();
+    assert!(
+        args.windows(2).any(|pair| pair == ["-T", "skim: command history"]),
+        "popup name lost: {cmd:?}"
+    );
+
+    Ok(())
+}

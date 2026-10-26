@@ -1,0 +1,304 @@
+name: Build & Test
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      plan:
+        required: false
+        type: string
+  # pull_request: # No need to trigger on PR, cargo-dist already does
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nextest:
+    runs-on: ${{matrix.runner}}
+    # Cap the wall-clock so a harness regression that makes the Zellij pane never
+    # render (each `wait_ready` then burning its full budget) fails the leg in
+    # minutes instead of letting a serialized e2e run drag on for hours.
+    timeout-minutes: 45
+    strategy:
+      # Report every OS independently: a failure on one (e.g. Windows) must not
+      # cancel the others, so we still get a clear signal from Linux and macOS.
+      fail-fast: false
+      matrix: &matrix
+        build: [linux, macos, windows]
+        include:
+          - build: linux
+            runner: ubuntu-latest
+          - build: macos
+            runner: macos-latest
+          - build: windows
+            runner: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - &zellij-install
+        # The e2e tests drive `sk` inside a Zellij session (Zellij 0.44+ runs on
+        # Linux, macOS and Windows). taiki-e/install-action fetches a prebuilt
+        # binary on Linux and macOS; it has no Windows binary and `cargo install
+        # zellij` fails building openssl from source on the runner, so Windows
+        # installs via winget below.
+        name: Install zellij (Linux/macOS)
+        if: runner.os != 'Windows'
+        uses: taiki-e/install-action@v2.87.21
+        with:
+          tool: zellij@0.44.3
+      - name: Install zellij (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          winget install --exact --id Zellij.Zellij --version 0.44.3 --source winget --accept-source-agreements --accept-package-agreements --disable-interactivity
+          # The winget package is an MSI that installs zellij and adds its dir to
+          # the machine PATH in the registry. Neither the current process nor
+          # GITHUB_PATH sees that until reloaded, so refresh PATH from the
+          # registry (with a Program Files fallback), then expose zellij's dir to
+          # later steps.
+          $env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:PATH
+          $exe = (Get-Command zellij.exe -ErrorAction SilentlyContinue).Source
+          if (-not $exe) { $exe = (Get-ChildItem 'C:\Program Files' -Recurse -Filter zellij.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName }
+          if (-not $exe) { throw "zellij.exe not found after winget install" }
+          $dir = Split-Path -Parent $exe
+          Write-Host "zellij installed at: $dir"
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
+          & $exe --version
+      - name: Show locale
+        run: locale
+        if: runner.os != 'Windows'
+
+      - &checkout
+        name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - &toolchain
+        name: Install rust toolchain
+        run: rustup toolchain install
+      - &nextest-install
+        name: Install nextest
+        uses: taiki-e/install-action@v2.87.21
+        with:
+          tool: nextest@0.9
+      - &cache
+        name: Setup cargo cache
+        uses: Swatinem/rust-cache@v2
+      - name: Run doctests
+        run: cargo test --doc
+      - name: "Run tests"
+        # Do not use `--all-targets` to avoid running benches
+        run: cargo nextest run --release --locked --profile ci --bins --lib --examples --tests
+        env:
+          LC_ALL: en_US.UTF-8
+          TERM: xterm-256color
+      - name: Show snapshot diffs on failure
+        if: failure()
+        run: |
+          find tests/snapshots/ -name "*.snap.new" | while read -r new_snap; do
+            base="${new_snap%.new}"
+            echo "=== Snapshot diff: $base ==="
+            echo "new: $new_snap"
+            cat "$new_snap"
+            if [ -f "$base" ]; then
+              echo "old: $base"
+              cat "$base"
+              diff "$base" "$new_snap"
+            fi
+          done
+        shell: bash
+
+  coverage:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: write
+    steps:
+      - *zellij-install
+      - *checkout
+      - *toolchain
+      - *nextest-install
+      - uses: taiki-e/install-action@v2.87.21
+        with:
+          tool: cargo-llvm-cov@0.8
+      - *cache
+      - name: "Run tests with coverage"
+        # Do not use `--all-targets` to avoid running benches
+        run: |
+          cargo +nightly llvm-cov nextest --locked --release --profile ci --branch --bins --lib --examples --tests --no-report
+          cargo +nightly llvm-cov report --release --cobertura --output-path coverage.xml
+          cargo +nightly llvm-cov report --release --html
+          echo "COVERAGE_PERCENT=$(cargo +nightly llvm-cov report --release | tail -n1 | awk '{ print $13 }')" | tee --append $GITHUB_ENV
+        env:
+          LC_ALL: en_US.UTF-8
+          TERM: xterm-256color
+      - name: "Generate coverage badge"
+        if: &if-master github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: emibcn/badge-action@v2.0.4
+        with:
+          label: 'Coverage'
+          status: ${{ env.COVERAGE_PERCENT }}
+          color: 'blue'
+          path: 'target/llvm-cov/html/coverage.svg'
+      - name: "Deploy coverage to gh-pages under /coverage"
+        if: *if-master
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: target/llvm-cov/html
+          destination_dir: coverage
+          keep_files: true
+
+  clippy:
+    runs-on: ${{matrix.runner}}
+    strategy:
+      matrix: *matrix
+    steps:
+      - *checkout
+      - *toolchain
+      - *cache
+      - name: Clippy
+        run: cargo clippy
+
+  rustfmt:
+    runs-on: ${{matrix.runner}}
+    strategy:
+      matrix: *matrix
+    steps:
+      - *checkout
+      - *toolchain
+      - name: Check formatting
+        run: |
+          cargo fmt --all -- --check
+
+  clippy-no-default-features:
+    runs-on: ${{matrix.runner}}
+    strategy:
+      matrix: *matrix
+    steps:
+      - *checkout
+      - *toolchain
+      - *cache
+      - name: Run clippy with specific features
+        run: |
+          cargo clippy --locked --no-default-features -- -Dwarnings
+          cargo clippy --locked --no-default-features --features cli -- -Dwarnings
+          cargo clippy --locked --no-default-features --features image -- -Dwarnings
+          cargo clippy --locked --no-default-features --features listen -- -Dwarnings
+          cargo clippy --locked --no-default-features --features frizbee -- -Dwarnings
+
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - *checkout
+      - *toolchain
+      - name: MSRV Verify
+        run: cargo +1.91.0 build --release --locked --all-targets
+
+  fuzz:
+    permissions:
+      contents: read
+    runs-on: ${{matrix.runner}}
+    strategy:
+      matrix: *matrix
+    steps:
+      - *checkout
+      - *toolchain
+      - *cache
+      - name: Set up MSVC dev environment
+        # Without a sanitizer, libFuzzer's coverage instrumentation fails to
+        # link on Windows: neither MSVC's link.exe nor LLD's COFF driver
+        # synthesize the __start/__stop section-boundary symbols it needs
+        # (an ELF/Mach-O-only linker feature). MSVC's AddressSanitizer
+        # runtime provides an equivalent shim for those symbols, so it's
+        # required for the link to succeed at all, not just extra bug
+        # detection. It needs its DLL directory on PATH at run time, which
+        # this action sets up (see
+        # https://rust-fuzz.github.io/book/cargo-fuzz/windows/setup.html).
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - uses: taiki-e/install-action@v2.87.21
+        with:
+          tool: cargo-fuzz@0.13
+      - name: Run fuzz targets
+        shell: bash
+        # 5 targets * 60s = 5 minutes of fuzzing total per run.
+        # Force the actual host target: the sanitizer build can't link
+        # against a statically-linked libc (e.g. if CARGO_BUILD_TARGET
+        # defaults to a musl target elsewhere in the matrix).
+        run: |
+          host_target="$(rustc +nightly -vV | sed -n 's/^host: //p')"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Git Bash's own coreutils `link` (for hardlinks) sits ahead of
+            # the MSVC one on PATH within this shell, so cargo/rustc would
+            # otherwise invoke the wrong `link.exe`. Point at the real MSVC
+            # linker explicitly, using the dev env ilammy/msvc-dev-cmd set up.
+            export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="${VCToolsInstallDir}bin\\HostX64\\x64\\link.exe"
+          fi
+          for target in ansi_strip field_extract fuzzy_match query_match keymap_parse; do
+            cargo +nightly fuzz run "$target" --target "$host_target" -- -max_total_time=60
+          done
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashes-${{ runner.os }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  # Single aggregate status check for branch protection / repository rulesets,
+  # so they don't need to enumerate every matrix leg by name individually.
+
+  public-api:
+    name: Check for public API breaking changes
+    permissions:
+      contents: read
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - *checkout
+      - *toolchain
+      - *cache
+      - uses: taiki-e/install-action@v2.87.21
+        with:
+          tool: cargo-public-api@0.52
+      - run: rustup toolchain install nightly-x86_64-unknown-linux-gnu
+        name: Install nightly toolchain
+      # Compare two repository revisions so cargo-public-api uses their committed
+      # lockfiles. A registry comparison resolves the released crate again and can
+      # fail when a new, broken transitive dependency is published.
+      - run: git fetch --force --tags
+        name: Fetch release tags
+      - run: |
+          latest_tag="$(git tag --list 'v*' --sort=-version:refname | head -n1)"
+          cargo public-api diff "${latest_tag}..HEAD" --deny removed --deny changed
+        name: Run cargo-public-api
+
+
+  ci-success:
+    name: CI Success
+    if: always()
+    needs:
+      - nextest
+      - coverage
+      - clippy
+      - rustfmt
+      - clippy-no-default-features
+      - msrv
+      - fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all required jobs succeeded
+        run: |
+          echo "${{ toJson(needs) }}"
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" || "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more required jobs failed or were cancelled."
+            exit 1
+          fi
+          echo "All required jobs passed."

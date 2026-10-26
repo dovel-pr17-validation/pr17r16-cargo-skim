@@ -1,0 +1,79 @@
+experimental = ["wrapper-scripts"]
+
+# The end-to-end tests drive `sk` inside a Zellij session that each test creates
+# and tears down itself (see tests/common/zellij.rs), so — unlike the previous
+# tmux-based harness — no shared multiplexer session needs to be set up here.
+
+# Valgrind wrapper for memory leak detection
+[scripts.wrapper.valgrind]
+command = [
+    "valgrind",
+    "--leak-check=full",
+    "--show-leak-kinds=all",
+    "--track-origins=yes",
+    "--error-exitcode=1",
+    "--suppressions=.config/valgrind.supp"
+]
+
+# The end-to-end tests each spin up a full Zellij session (server + client +
+# PTY). Running many concurrently overwhelms the machine and makes the
+# timing-sensitive tests flaky, so serialize everything in this group while the
+# rest of the suite keeps running in parallel. (Under raw `cargo test`, pass
+# `--test-threads=1` for the e2e test binaries instead.)
+[test-groups]
+e2e = { max-threads = 1 }
+
+[profile.default]
+fail-fast = false
+retries = 2
+[[profile.default.overrides]]
+filter = 'binary(interactive) | binary(listen) | binary(popup) | binary(execute)'
+test-group = 'e2e'
+[profile.default.junit]
+path = "junit.xml"
+
+[profile.ci]
+retries = 9
+[[profile.ci.overrides]]
+filter = 'binary(interactive) | binary(listen) | binary(popup) | binary(execute)'
+test-group = 'e2e'
+
+# Valgrind profile for memory leak detection
+# Usage: cargo nextest run --profile valgrind
+#
+# Note: Valgrind can detect memory leaks but does NOT detect dangling threads.
+# For thread leak detection, use ThreadSanitizer instead (see below).
+[profile.valgrind]
+fail-fast = false
+retries = 2
+test-threads = 1  # Run tests serially to avoid interleaved valgrind output
+[[profile.valgrind.scripts]]
+platform = "cfg(unix)"
+run-wrapper = "valgrind"
+
+# ThreadSanitizer profile for detecting data races and thread issues
+# Usage:
+#   1. First build with sanitizer (rebuilds stdlib and all deps):
+#      RUSTFLAGS="-Zsanitizer=thread" cargo +nightly build --tests -Zbuild-std --target x86_64-unknown-linux-gnu
+#   2. Then run tests:
+#      TSAN_OPTIONS="detect_deadlocks=1" cargo +nightly nextest run --profile tsan --target x86_64-unknown-linux-gnu
+#
+# Note: ThreadSanitizer can detect:
+#   - Data races (concurrent unsynchronized access to memory)
+#   - Deadlocks (with TSAN_OPTIONS=detect_deadlocks=1)
+#   - Thread leaks (threads not joined before program exit)
+#
+# Requirements:
+#   - Rust nightly (for -Zsanitizer and -Zbuild-std flags)
+#   - The -Zbuild-std flag rebuilds the standard library with ThreadSanitizer
+#     instrumentation to avoid ABI mismatch errors
+#
+# Important: This takes a long time on first build as it recompiles everything
+# including the standard library with ThreadSanitizer instrumentation.
+#
+# Environment variables:
+#   TSAN_OPTIONS="detect_deadlocks=1 second_deadlock_stack=1"
+[profile.tsan]
+fail-fast = false
+retries = 3
+test-threads = 1  # TSan requires running tests serially
